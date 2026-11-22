@@ -27,7 +27,22 @@ final class LPT_GitHub_Updater {
 		add_filter( 'upgrader_source_selection', array( $this, 'rename_source' ), 10, 4 );
 		add_action( 'upgrader_process_complete', array( $this, 'after_upgrade' ), 10, 2 );
 		add_action( 'load-plugins.php', array( $this, 'maybe_force_check' ) );
-		add_filter( 'plugin_action_links_' . LPT_Config::BASENAME, array( $this, 'action_links' ) );
+		add_filter( 'plugin_action_links_' . $this->basename(), array( $this, 'action_links' ) );
+	}
+
+	/**
+	 * Basename of the main plugin file as installed on this site.
+	 *
+	 * The plugin folder may differ from the repository slug — a GitHub archive
+	 * unpacks as <owner>-<repo>-<hash>, and a manual install may use any name.
+	 * The update key therefore has to be read from the filesystem at runtime:
+	 * a key that matches no installed plugin makes the update badge count an
+	 * entry that the Updates screen never lists.
+	 *
+	 * @return string e.g. limit-post-tags/limit-post-tags.php.
+	 */
+	private function basename(): string {
+		return plugin_basename( LPT_PLUGIN_FILE );
 	}
 
 	/* ============================================================
@@ -49,15 +64,23 @@ final class LPT_GitHub_Updater {
 			$transient->response = array();
 		}
 
+		$basename = $this->basename();
+
+		// Drop entries left under a previous folder name on every check, not
+		// only when a newer version exists: the badge counts them even though
+		// the Updates screen never lists a key that matches no installed
+		// plugin.
+		$this->drop_stale_entries( $transient, $basename );
+
 		$release = $this->get_release();
 		if ( $release === null || version_compare( $release['version'], LPT_VERSION, '<=' ) ) {
 			return $transient;
 		}
 
-		$transient->response[ LPT_Config::BASENAME ] = (object) array(
-			'id'            => LPT_Config::BASENAME,
+		$transient->response[ $basename ] = (object) array(
+			'id'            => $basename,
 			'slug'          => LPT_Config::SLUG,
-			'plugin'        => LPT_Config::BASENAME,
+			'plugin'        => $basename,
 			'new_version'   => $release['version'],
 			'url'           => 'https://github.com/' . LPT_Config::REPO,
 			'package'       => $release['package'],
@@ -70,10 +93,64 @@ final class LPT_GitHub_Updater {
 		);
 
 		if ( isset( $transient->no_update ) && is_array( $transient->no_update ) ) {
-			unset( $transient->no_update[ LPT_Config::BASENAME ] );
+			unset( $transient->no_update[ $basename ] );
 		}
 
 		return $transient;
+	}
+
+	/**
+	 * Removes update entries that point at this plugin's main file but sit
+	 * under a key other than the installed basename.
+	 *
+	 * Such an entry is a leftover from a previous folder name: the badge
+	 * counts it, while get_plugin_updates() only lists entries whose key is a
+	 * real plugin file, so the Updates screen looks empty.
+	 *
+	 * @param object $transient The update_plugins transient.
+	 * @param string $basename  Current plugin basename.
+	 */
+	private function drop_stale_entries( $transient, string $basename ): void {
+		if ( ! isset( $transient->response ) || ! is_array( $transient->response ) ) {
+			return;
+		}
+
+		$main_file = wp_basename( $basename );
+
+		foreach ( array_keys( $transient->response ) as $key ) {
+			$key = (string) $key;
+
+			if ( $key === $basename ) {
+				continue;
+			}
+			if ( ! $this->points_at_main_file( $key, $transient->response[ $key ], $main_file ) ) {
+				continue;
+			}
+
+			unset( $transient->response[ $key ] );
+		}
+	}
+
+	/**
+	 * Whether an update entry describes this plugin's main file.
+	 *
+	 * @param string $key       Entry key in the response array.
+	 * @param mixed  $entry     Entry value.
+	 * @param string $main_file Main file name, e.g. limit-post-tags.php.
+	 * @return bool
+	 */
+	private function points_at_main_file( string $key, $entry, string $main_file ): bool {
+		if ( wp_basename( $key ) === $main_file ) {
+			return true;
+		}
+		if ( ! is_object( $entry ) ) {
+			return false;
+		}
+		if ( isset( $entry->plugin ) && wp_basename( (string) $entry->plugin ) === $main_file ) {
+			return true;
+		}
+
+		return isset( $entry->id ) && wp_basename( (string) $entry->id ) === $main_file;
 	}
 
 	/**
@@ -119,8 +196,9 @@ final class LPT_GitHub_Updater {
 
 	/**
 	 * GitHub archives unpack into a directory like
-	 * Gnoztis-limit-post-tags-1a2b3c4 — rename it to the plugin slug, otherwise
-	 * WordPress updates the wrong directory.
+	 * Gnoztis-limit-post-tags-1a2b3c4 — rename it to the name of the installed
+	 * plugin directory, otherwise WordPress installs a second copy next to the
+	 * real one.
 	 *
 	 * @param string $source
 	 * @param string $remote_source
@@ -129,17 +207,24 @@ final class LPT_GitHub_Updater {
 	 * @return string
 	 */
 	public function rename_source( $source, $remote_source, $upgrader, $hook_extra = array() ) {
+		$basename = $this->basename();
+
 		if ( ! is_string( $source ) || ! is_string( $remote_source ) ) {
 			return $source;
 		}
-		if ( ! is_array( $hook_extra ) || empty( $hook_extra['plugin'] ) || LPT_Config::BASENAME !== $hook_extra['plugin'] ) {
+		if ( ! is_array( $hook_extra ) || empty( $hook_extra['plugin'] ) || $basename !== (string) $hook_extra['plugin'] ) {
 			return $source;
 		}
-		if ( ! is_dir( $source ) || ! is_file( trailingslashit( $source ) . 'limit-post-tags.php' ) ) {
+		if ( ! is_dir( $source ) || ! is_file( trailingslashit( $source ) . wp_basename( $basename ) ) ) {
 			return $source;
 		}
 
-		$desired = trailingslashit( $remote_source ) . LPT_Config::SLUG;
+		$folder = dirname( $basename );
+		if ( '.' === $folder || '' === $folder || '/' === $folder ) {
+			return $source;
+		}
+
+		$desired = trailingslashit( $remote_source ) . $folder;
 		if ( untrailingslashit( $source ) === untrailingslashit( $desired ) ) {
 			return $source;
 		}
@@ -168,8 +253,10 @@ final class LPT_GitHub_Updater {
 	 * @param array $hook_extra
 	 */
 	public function after_upgrade( $upgrader = null, $hook_extra = array() ): void {
+		$basename = $this->basename();
+
 		if ( is_array( $hook_extra ) && ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
-			if ( ! in_array( LPT_Config::BASENAME, $hook_extra['plugins'], true ) ) {
+			if ( ! in_array( $basename, $hook_extra['plugins'], true ) ) {
 				return;
 			}
 		}

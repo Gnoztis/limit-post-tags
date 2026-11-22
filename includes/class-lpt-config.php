@@ -87,11 +87,13 @@ final class LPT_Config {
 	/** GitHub repository the updates come from. */
 	public const REPO = 'Gnoztis/limit-post-tags';
 
-	/** Plugin slug — also the archive directory name on GitHub. */
+	/** Plugin slug — the GitHub repository name and the release asset name. */
 	public const SLUG = 'limit-post-tags';
 
-	/** Plugin basename relative to wp-content/plugins. */
-	public const BASENAME = 'limit-post-tags/limit-post-tags.php';
+	// The installed plugin basename is not a constant: the folder on a site may
+	// differ from the repository slug, so the updater derives the update key
+	// and the target directory from plugin_basename( LPT_PLUGIN_FILE ) at
+	// runtime.
 
 	/** Transient holding the result of the last successful update check. */
 	public const UPDATE_TRANSIENT = 'lpt_github_release';

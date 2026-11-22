@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Limit Post Tags
  * Description: Ограничивает вывод меток до 5 штук и добавляет кнопку «Ещё N меток» как продолжение списка. Скрытие лишних меток через CSS-класс, без обрезки по высоте — кнопка всегда видна.
- * Version:     1.7.0
+ * Version:     1.7.1
  * Requires at least: 7.0
  * Requires PHP: 8.4
  * Author:      Gnostis
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'LPT_VERSION', '1.7.0' );
+define( 'LPT_VERSION', '1.7.1' );
 define( 'LPT_PLUGIN_FILE', __FILE__ );
 define( 'LPT_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
