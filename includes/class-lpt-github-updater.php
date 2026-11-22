@@ -9,8 +9,8 @@ if ( ! defined( 'ABSPATH' ) ) {
  *
  * The source of truth is the highest version across the latest release and
  * the vX.Y.Z tag list: a repository may hold an old release (1.6.3) and a
- * newer tag (1.7.0), and preferring the release would never offer the new
- * version. WordPress sees the winning version, shows it under Plugins and
+ * newer tag (a repository may hold an old release and a newer tag), and
+ * preferring the release would never offer the new version. WordPress sees the winning version, shows it under Plugins and
  * updates from the package of the source that won. No third-party libraries
  * and no write requests to the repository.
  */
@@ -45,6 +45,33 @@ final class LPT_GitHub_Updater {
 		return plugin_basename( LPT_PLUGIN_FILE );
 	}
 
+	/**
+	 * Version of the plugin as written in the header of the main file on disk.
+	 *
+	 * LPT_VERSION is defined when the request starts. In the request that
+	 * replaces the plugin files the constant still holds the old version while
+	 * the file on disk is already new, so comparing a release with the constant
+	 * alone offers the version that was just installed. The header is read from
+	 * disk on every call; when it cannot be read the constant is the fallback.
+	 *
+	 * @return string
+	 */
+	private function installed_version(): string {
+		if ( function_exists( 'get_file_data' ) ) {
+			$data = get_file_data(
+				LPT_PLUGIN_FILE,
+				array( 'Version' => 'Version' ),
+				'plugin'
+			);
+
+			if ( isset( $data['Version'] ) && '' !== (string) $data['Version'] ) {
+				return (string) $data['Version'];
+			}
+		}
+
+		return LPT_VERSION;
+	}
+
 	/* ============================================================
 	 *  Update plumbing
 	 * ============================================================ */
@@ -64,7 +91,8 @@ final class LPT_GitHub_Updater {
 			$transient->response = array();
 		}
 
-		$basename = $this->basename();
+		$basename  = $this->basename();
+		$installed = $this->installed_version();
 
 		// Drop entries left under a previous folder name on every check, not
 		// only when a newer version exists: the badge counts them even though
@@ -72,8 +100,17 @@ final class LPT_GitHub_Updater {
 		// plugin.
 		$this->drop_stale_entries( $transient, $basename );
 
+		// An entry that offers the version already on disk is a phantom: core
+		// rewrote the transient in the request that replaced the files, while
+		// LPT_VERSION still pointed at the old version.
+		$this->drop_installed_entry( $transient, $basename, $installed );
+
 		$release = $this->get_release();
-		if ( $release === null || version_compare( $release['version'], LPT_VERSION, '<=' ) ) {
+		if (
+			$release === null
+			|| version_compare( $release['version'], LPT_VERSION, '<=' )
+			|| version_compare( $release['version'], $installed, '<=' )
+		) {
 			return $transient;
 		}
 
@@ -151,6 +188,36 @@ final class LPT_GitHub_Updater {
 		}
 
 		return isset( $entry->id ) && wp_basename( (string) $entry->id ) === $main_file;
+	}
+
+	/**
+	 * Removes our update entry when it offers a version that is already on disk.
+	 *
+	 * The entry is written when core rewrites the transient in the request that
+	 * replaces the plugin files: LPT_VERSION still points at the old version
+	 * there, so the release looks newer than the code in memory while the files
+	 * are already updated. The response entry would then live for the whole
+	 * cache window and offer "update" to the version in use.
+	 *
+	 * @param object $transient The update_plugins transient.
+	 * @param string $basename  Current plugin basename.
+	 * @param string $installed Version from the plugin header on disk.
+	 */
+	private function drop_installed_entry( $transient, string $basename, string $installed ): void {
+		if ( ! isset( $transient->response[ $basename ] ) ) {
+			return;
+		}
+
+		$entry       = $transient->response[ $basename ];
+		$new_version = is_object( $entry ) && isset( $entry->new_version ) ? (string) $entry->new_version : '';
+
+		if ( '' === $new_version ) {
+			return;
+		}
+
+		if ( version_compare( $new_version, $installed, '<=' ) ) {
+			unset( $transient->response[ $basename ] );
+		}
 	}
 
 	/**
@@ -254,12 +321,23 @@ final class LPT_GitHub_Updater {
 	 */
 	public function after_upgrade( $upgrader = null, $hook_extra = array() ): void {
 		$basename = $this->basename();
+		$ours     = true;
 
-		if ( is_array( $hook_extra ) && ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
-			if ( ! in_array( $basename, $hook_extra['plugins'], true ) ) {
-				return;
+		if ( is_array( $hook_extra ) ) {
+			if ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
+				$ours = in_array( $basename, $hook_extra['plugins'], true );
+			} elseif ( ! empty( $hook_extra['plugin'] ) ) {
+				$ours = $basename === (string) $hook_extra['plugin'];
 			}
 		}
+
+		if ( ! $ours ) {
+			return;
+		}
+
+		// The cached release still describes the version that was just
+		// installed; dropping it makes the next check read GitHub again instead
+		// of serving the stale new_version/tested pair.
 		$this->flush();
 	}
 
