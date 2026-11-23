@@ -1,84 +1,95 @@
 <?php
+/**
+ * GitHub updater for Limit Post Tags.
+ *
+ * GENERATED FILE — do not edit by hand.
+ * Source: tools/shared/updater/class-github-updater.php
+ * Regenerate: node tools/scripts/sync-updater.mjs limit-post-tags
+ */
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
 /**
- * Plugin updates through the native WordPress mechanism, sourced from GitHub
- * releases and tags of Gnoztis/limit-post-tags.
+ * Plugin updates through the native WordPress mechanism; source — GitHub
+ * Releases and tags of the repository constant.
  *
- * The source of truth is the highest version across the latest release and
- * the vX.Y.Z tag list: a repository may hold an old release (1.6.3) and a
- * newer tag (a repository may hold an old release and a newer tag), and
- * preferring the release would never offer the new version. WordPress sees the winning version, shows it under Plugins and
- * updates from the package of the source that won. No third-party libraries
- * and no write requests to the repository.
+ * The source of truth is the highest version of the GitHub Release and the
+ * newest vX.Y.Z tag: WordPress sees the new version, shows it under Plugins
+ * and updates from the package of the winning source.
+ * No third-party libraries and no write requests to the repository.
  */
 final class LPT_GitHub_Updater {
+
+	private const TRANSIENT       = 'lpt_github_release';
+	private const ERROR_TRANSIENT = 'lpt_github_release_error';
 
 	private static ?array $header = null;
 
 	/**
-	 * Hooks the update plumbing.
+	 * Explicit user action, not a scheduled check: must not be answered from
+	 * the error backoff, which otherwise hides the fact that no request was
+	 * made at all.
 	 */
+	private static bool $force = false;
+
+	/**
+	 * Failure of the request in flight: ['code' => int, 'reason' => string,
+	 * 'at' => int]. The reason vocabulary lives in error_reason().
+	 *
+	 * @var array{code:int,reason:string,at:int}|null
+	 */
+	private ?array $last_error = null;
+
 	public function register_hooks(): void {
-		add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'inject_update' ) );
-		add_filter( 'plugins_api', array( $this, 'plugin_info' ), 10, 3 );
-		add_filter( 'upgrader_source_selection', array( $this, 'rename_source' ), 10, 4 );
-		add_action( 'upgrader_process_complete', array( $this, 'after_upgrade' ), 10, 2 );
-		add_action( 'load-plugins.php', array( $this, 'maybe_force_check' ) );
-		add_filter( 'plugin_action_links_' . $this->basename(), array( $this, 'action_links' ) );
+		add_filter( 'pre_set_site_transient_update_plugins', [ $this, 'inject_update' ] );
+		add_filter( 'plugins_api',                           [ $this, 'plugin_info' ], 10, 3 );
+		add_filter( 'upgrader_source_selection',             [ $this, 'rename_source' ], 10, 4 );
+		add_action( 'upgrader_process_complete',             [ $this, 'after_upgrade' ], 10, 2 );
+		add_action( 'load-plugins.php',                      [ $this, 'maybe_force_check' ] );
+		add_action( 'admin_notices',                         [ $this, 'admin_notices' ] );
+		add_filter( 'plugin_action_links_' . self::basename(), [ $this, 'action_links' ] );
 	}
 
 	/**
-	 * Basename of the main plugin file as installed on this site.
+	 * Basename of the installed main plugin file, e.g.
+	 * "limit-post-tags/limit-post-tags.php".
 	 *
-	 * The plugin folder may differ from the repository slug — a GitHub archive
-	 * unpacks as <owner>-<repo>-<hash>, and a manual install may use any name.
-	 * The update key therefore has to be read from the filesystem at runtime:
-	 * a key that matches no installed plugin makes the update badge count an
-	 * entry that the Updates screen never lists.
-	 *
-	 * @return string e.g. limit-post-tags/limit-post-tags.php.
+	 * Computed at runtime, never taken from a constant: the folder is
+	 * whatever the site has. A GitHub zipball unpacks into
+	 * Gnoztis-limit-post-tags-<sha>, a manual upload can use any name.
+	 * WordPress keys update_plugins->response by this basename and counts
+	 * every entry for the admin badge, but lists only entries whose key
+	 * matches a file from get_plugins() — so a hard-coded key shows an
+	 * "update available" badge with an empty update list.
 	 */
-	private function basename(): string {
-		return plugin_basename( LPT_PLUGIN_FILE );
-	}
+	public static function basename(): string {
+		$basename = plugin_basename( LPT_PLUGIN_FILE );
 
-	/**
-	 * Version of the plugin as written in the header of the main file on disk.
-	 *
-	 * LPT_VERSION is defined when the request starts. In the request that
-	 * replaces the plugin files the constant still holds the old version while
-	 * the file on disk is already new, so comparing a release with the constant
-	 * alone offers the version that was just installed. The header is read from
-	 * disk on every call; when it cannot be read the constant is the fallback.
-	 *
-	 * @return string
-	 */
-	private function installed_version(): string {
-		if ( function_exists( 'get_file_data' ) ) {
-			$data = get_file_data(
-				LPT_PLUGIN_FILE,
-				array( 'Version' => 'Version' ),
-				'plugin'
-			);
-
-			if ( isset( $data['Version'] ) && '' !== (string) $data['Version'] ) {
-				return (string) $data['Version'];
-			}
+		if ( $basename === '' ) {
+			// plugin_basename() returns the path relative to the plugin
+			// directory; an empty result means the main file was not inside
+			// it, so fall back to the documented layout.
+			$basename = 'limit-post-tags' . '/' . wp_basename( LPT_PLUGIN_FILE );
 		}
 
-		return LPT_VERSION;
+		return $basename;
 	}
 
 	/* ============================================================
-	 *  Update plumbing
+	 *  Updates
 	 * ============================================================ */
 
 	/**
-	 * Adds our entry to the update_plugins transient when GitHub has a newer
-	 * release than the installed version.
+	 * Adds our entry to the update_plugins transient when GitHub has a
+	 * release newer than the installed version.
+	 *
+	 * The comparison is made against both the version constant and the
+	 * header of the file on disk: inside the request that replaces the
+	 * files, core re-writes this transient while the constant still holds
+	 * the version loaded at the start of the request. Comparing only with
+	 * the constant would re-inject "2.5.0 -> 2.5.0" right after a
+	 * successful update, and the phantom entry would live up to 12 hours.
 	 *
 	 * @param mixed $transient
 	 * @return mixed
@@ -88,46 +99,47 @@ final class LPT_GitHub_Updater {
 			return $transient;
 		}
 		if ( ! isset( $transient->response ) || ! is_array( $transient->response ) ) {
-			$transient->response = array();
+			$transient->response = [];
 		}
 
-		$basename  = $this->basename();
+		$basename  = self::basename();
 		$installed = $this->installed_version();
 
-		// Drop entries left under a previous folder name on every check, not
-		// only when a newer version exists: the badge counts them even though
-		// the Updates screen never lists a key that matches no installed
-		// plugin.
-		$this->drop_stale_entries( $transient, $basename );
+		// Runs before the early returns: a dangling entry is a leftover of
+		// the previous key and must disappear even when GitHub is
+		// unreachable right now.
+		$this->purge_stale_entries( $transient, $basename );
 
-		// An entry that offers the version already on disk is a phantom: core
-		// rewrote the transient in the request that replaced the files, while
-		// LPT_VERSION still pointed at the old version.
-		$this->drop_installed_entry( $transient, $basename, $installed );
+		// The entry offers what is already on disk: drop it, so a phantom
+		// left by an earlier run disappears on this one.
+		$this->purge_installed_entry( $transient, $basename, $installed );
 
 		$release = $this->get_release();
-		if (
-			$release === null
-			|| version_compare( $release['version'], LPT_VERSION, '<=' )
-			|| version_compare( $release['version'], $installed, '<=' )
-		) {
+		if ( $release === null ) {
 			return $transient;
 		}
 
-		$transient->response[ $basename ] = (object) array(
+		// Newer than the running code (constant) and than the files on
+		// disk (header), otherwise there is nothing to install.
+		if ( version_compare( $release['version'], LPT_VERSION, '<=' )
+			|| version_compare( $release['version'], $installed, '<=' ) ) {
+			return $transient;
+		}
+
+		$transient->response[ $basename ] = (object) [
 			'id'            => $basename,
-			'slug'          => LPT_Config::SLUG,
+			'slug'          => 'limit-post-tags',
 			'plugin'        => $basename,
 			'new_version'   => $release['version'],
-			'url'           => 'https://github.com/' . LPT_Config::REPO,
+			'url'           => 'https://github.com/' . 'Gnoztis/limit-post-tags',
 			'package'       => $release['package'],
 			'tested'        => $release['tested'],
 			'requires'      => $release['requires'],
 			'requires_php'  => $release['requires_php'],
-			'icons'         => array(),
-			'banners'       => array(),
+			'icons'         => [],
+			'banners'       => [],
 			'compatibility' => new stdClass(),
-		);
+		];
 
 		if ( isset( $transient->no_update ) && is_array( $transient->no_update ) ) {
 			unset( $transient->no_update[ $basename ] );
@@ -137,102 +149,99 @@ final class LPT_GitHub_Updater {
 	}
 
 	/**
-	 * Removes update entries that point at this plugin's main file but sit
-	 * under a key other than the installed basename.
+	 * Version of the main plugin file as it is on disk.
 	 *
-	 * Such an entry is a leftover from a previous folder name: the badge
-	 * counts it, while get_plugin_updates() only lists entries whose key is a
-	 * real plugin file, so the Updates screen looks empty.
-	 *
-	 * @param object $transient The update_plugins transient.
-	 * @param string $basename  Current plugin basename.
+	 * Deliberately not cached in a static: the whole point is to see the
+	 * files after Plugin_Upgrader replaced them within the current request.
+	 * get_file_data() reads the first 8 KB of one file, so the cost is
+	 * negligible next to the transient write it guards.
 	 */
-	private function drop_stale_entries( $transient, string $basename ): void {
-		if ( ! isset( $transient->response ) || ! is_array( $transient->response ) ) {
-			return;
-		}
+	private function installed_version(): string {
+		$data = function_exists( 'get_file_data' )
+			? get_file_data( LPT_PLUGIN_FILE, [ 'Version' => 'Version' ], 'plugin' )
+			: [];
 
-		$main_file = wp_basename( $basename );
+		$version = isset( $data['Version'] ) ? trim( (string) $data['Version'] ) : '';
 
-		foreach ( array_keys( $transient->response ) as $key ) {
-			$key = (string) $key;
-
-			if ( $key === $basename ) {
-				continue;
-			}
-			if ( ! $this->points_at_main_file( $key, $transient->response[ $key ], $main_file ) ) {
-				continue;
-			}
-
-			unset( $transient->response[ $key ] );
-		}
+		return $version !== '' ? $version : LPT_VERSION;
 	}
 
 	/**
-	 * Whether an update entry describes this plugin's main file.
+	 * Removes our own update entry when it offers what is already installed.
 	 *
-	 * @param string $key       Entry key in the response array.
-	 * @param mixed  $entry     Entry value.
-	 * @param string $main_file Main file name, e.g. limit-post-tags.php.
-	 * @return bool
+	 * Core compares the entry's new_version with the version from
+	 * get_plugins() and shows the row as an update anyway until the
+	 * transient is rebuilt, so the entry must not stay in response.
+	 *
+	 * @param mixed  $transient
+	 * @param string $basename Our key in the transient.
+	 * @param string $installed Version from the file on disk.
 	 */
-	private function points_at_main_file( string $key, $entry, string $main_file ): bool {
-		if ( wp_basename( $key ) === $main_file ) {
-			return true;
-		}
-		if ( ! is_object( $entry ) ) {
-			return false;
-		}
-		if ( isset( $entry->plugin ) && wp_basename( (string) $entry->plugin ) === $main_file ) {
-			return true;
-		}
-
-		return isset( $entry->id ) && wp_basename( (string) $entry->id ) === $main_file;
-	}
-
-	/**
-	 * Removes our update entry when it offers a version that is already on disk.
-	 *
-	 * The entry is written when core rewrites the transient in the request that
-	 * replaces the plugin files: LPT_VERSION still points at the old version
-	 * there, so the release looks newer than the code in memory while the files
-	 * are already updated. The response entry would then live for the whole
-	 * cache window and offer "update" to the version in use.
-	 *
-	 * @param object $transient The update_plugins transient.
-	 * @param string $basename  Current plugin basename.
-	 * @param string $installed Version from the plugin header on disk.
-	 */
-	private function drop_installed_entry( $transient, string $basename, string $installed ): void {
-		if ( ! isset( $transient->response[ $basename ] ) ) {
+	private function purge_installed_entry( $transient, string $basename, string $installed ): void {
+		if ( ! isset( $transient->response[ $basename ] ) || ! is_object( $transient->response[ $basename ] ) ) {
 			return;
 		}
 
-		$entry       = $transient->response[ $basename ];
-		$new_version = is_object( $entry ) && isset( $entry->new_version ) ? (string) $entry->new_version : '';
+		$entry   = $transient->response[ $basename ];
+		$offered = isset( $entry->new_version ) ? trim( (string) $entry->new_version ) : '';
 
-		if ( '' === $new_version ) {
-			return;
-		}
-
-		if ( version_compare( $new_version, $installed, '<=' ) ) {
+		if ( $offered === '' || version_compare( $offered, $installed, '<=' ) ) {
 			unset( $transient->response[ $basename ] );
+			return;
+		}
+
+		// Not newer than the constant either — the same phantom, seen from
+		// the other side.
+		if ( version_compare( $offered, LPT_VERSION, '<=' ) ) {
+			unset( $transient->response[ $basename ] );
+		}
+	}
+
+	/**
+	 * Drops update entries that point at our main file under a foreign key.
+	 *
+	 * Such entries are leftovers of the hard-coded basename this class used
+	 * before, or of a folder that was renamed. They make the admin badge
+	 * count an update that get_plugin_updates() cannot list, because the
+	 * key does not match any installed plugin file.
+	 *
+	 * @param mixed  $transient
+	 * @param string $basename Our real basename, kept as is.
+	 */
+	private function purge_stale_entries( $transient, string $basename ): void {
+		$main = wp_basename( LPT_PLUGIN_FILE );
+
+		foreach ( [ 'response', 'no_update' ] as $bucket ) {
+			if ( ! isset( $transient->$bucket ) || ! is_array( $transient->$bucket ) ) {
+				continue;
+			}
+
+			foreach ( $transient->$bucket as $key => $entry ) {
+				if ( (string) $key === $basename || ! is_object( $entry ) ) {
+					continue;
+				}
+				if ( empty( $entry->plugin ) || wp_basename( (string) $entry->plugin ) !== $main ) {
+					continue;
+				}
+
+				unset( $transient->$bucket[ $key ] );
+			}
 		}
 	}
 
 	/**
 	 * Data for the View plugin details modal.
 	 *
-	 * @param mixed  $result
+	 * @param mixed $result
 	 * @param string $action
-	 * @param mixed  $args
+	 * @param mixed $args
 	 * @return mixed
 	 */
 	public function plugin_info( $result, $action, $args ) {
 		if ( 'plugin_information' !== $action || ! is_object( $args ) || empty( $args->slug ) ) {
 			return $result;
 		}
-		if ( LPT_Config::SLUG !== (string) $args->slug ) {
+		if ( 'limit-post-tags' !== (string) $args->slug ) {
 			return $result;
 		}
 
@@ -243,29 +252,29 @@ final class LPT_GitHub_Updater {
 
 		$header = $this->header_data();
 
-		return (object) array(
+		return (object) [
 			'name'          => 'Limit Post Tags',
-			'slug'          => LPT_Config::SLUG,
+			'slug'          => 'limit-post-tags',
 			'version'       => $release['version'],
-			'author'        => '<a href="https://github.com/Gnoztis">Gnostis</a>',
-			'homepage'      => 'https://github.com/' . LPT_Config::REPO,
+			'author'        => '<a href="https://github.com/Gnoztis">Gnoztis</a>',
+			'homepage'      => 'https://github.com/' . 'Gnoztis/limit-post-tags',
 			'requires'      => $header['requires'],
-			'tested'        => $release['tested'],
+			'tested'        => $this->tested_version( $header['tested'] ),
 			'requires_php'  => $header['requires_php'],
 			'download_link' => $release['package'],
 			'last_updated'  => $release['published_at'],
-			'sections'      => array(
-				'description' => esc_html__( 'Ограничивает вывод меток до 5 штук и добавляет кнопку «Ещё N меток» как продолжение списка.', 'limit-post-tags' ),
-				'changelog'   => $release['body'] !== '' ? wpautop( $release['body'] ) : esc_html__( 'Описание изменений в релизе не заполнено.', 'limit-post-tags' ),
-			),
-		);
+			'sections'      => [
+				'description' => __( 'Ограничивает вывод меток до 5 штук и добавляет кнопку «Ещё N меток» как продолжение списка. Скрытие лишних меток через CSS-класс, без обрезки по высоте — кнопка всегда видна.', 'limit-post-tags' ),
+				'changelog'   => $release['body'] !== '' ? wpautop( $release['body'] ) : __( 'Описание изменений в релизе не заполнено.', 'limit-post-tags' ),
+			],
+		];
 	}
 
 	/**
 	 * GitHub archives unpack into a directory like
-	 * Gnoztis-limit-post-tags-1a2b3c4 — rename it to the name of the installed
-	 * plugin directory, otherwise WordPress installs a second copy next to the
-	 * real one.
+	 * Gnoztis-limit-post-tags-1a2b3c4 — rename it to the directory the site
+	 * actually uses (the folder of the installed main file), otherwise
+	 * WordPress updates the wrong directory or adds a second copy.
 	 *
 	 * @param string $source
 	 * @param string $remote_source
@@ -273,21 +282,31 @@ final class LPT_GitHub_Updater {
 	 * @param array  $hook_extra
 	 * @return string
 	 */
-	public function rename_source( $source, $remote_source, $upgrader, $hook_extra = array() ) {
-		$basename = $this->basename();
-
+	public function rename_source( $source, $remote_source, $upgrader, $hook_extra = [] ) {
 		if ( ! is_string( $source ) || ! is_string( $remote_source ) ) {
 			return $source;
 		}
-		if ( ! is_array( $hook_extra ) || empty( $hook_extra['plugin'] ) || $basename !== (string) $hook_extra['plugin'] ) {
+		if ( ! is_array( $hook_extra ) || empty( $hook_extra['plugin'] ) ) {
 			return $source;
 		}
-		if ( ! is_dir( $source ) || ! is_file( trailingslashit( $source ) . wp_basename( $basename ) ) ) {
+		if ( self::basename() !== (string) $hook_extra['plugin'] ) {
+			return $source;
+		}
+		if ( ! is_dir( $source ) ) {
+			return $source;
+		}
+		if ( ! is_file( trailingslashit( $source ) . wp_basename( LPT_PLUGIN_FILE ) ) ) {
 			return $source;
 		}
 
-		$folder = dirname( $basename );
-		if ( '.' === $folder || '' === $folder || '/' === $folder ) {
+		// Rename the unpacked directory to the folder the site actually
+		// uses, not to the slug: the update has to replace the installed
+		// directory, otherwise WordPress ends up with two copies of the
+		// plugin (one of them inactive).
+		$folder = dirname( self::basename() );
+		if ( $folder === '.' || $folder === '' ) {
+			// The main file sits directly in the plugins directory, so
+			// there is no directory to rename.
 			return $source;
 		}
 
@@ -313,32 +332,80 @@ final class LPT_GitHub_Updater {
 	}
 
 	/**
-	 * Reset the cached check after an upgrade so the site does not keep
-	 * advertising the version it has just installed.
-	 *
-	 * @param mixed $upgrader
-	 * @param array $hook_extra
+	 * Reset the update-check cache after an upgrade so we do not keep
+	 * advertising an update for the version just installed.
 	 */
-	public function after_upgrade( $upgrader = null, $hook_extra = array() ): void {
-		$basename = $this->basename();
-		$ours     = true;
+	public function after_upgrade( $upgrader = null, $hook_extra = [] ): void {
+		if ( is_array( $hook_extra ) && ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
+			if ( ! in_array( self::basename(), $hook_extra['plugins'], true ) ) {
+				return;
+			}
+		}
+		$this->flush();
+	}
 
-		if ( is_array( $hook_extra ) ) {
-			if ( ! empty( $hook_extra['plugins'] ) && is_array( $hook_extra['plugins'] ) ) {
-				$ours = in_array( $basename, $hook_extra['plugins'], true );
-			} elseif ( ! empty( $hook_extra['plugin'] ) ) {
-				$ours = $basename === (string) $hook_extra['plugin'];
+	/**
+	 * Update state for the /me diagnostics.
+	 *
+	 * Answers "why does the admin show an update badge with nothing to
+	 * update?" in one request: the real basename, and the entry the
+	 * update_plugins transient holds for our main file — including the key
+	 * it sits under, which is where a mismatch shows up.
+	 *
+	 * @return array{plugin_basename:string,transient_entry:bool,transient_key:string,new_version:string,package:string,last_error:array{code:int,reason:string,at:int}|null,next_retry_in:int,token_configured:bool}
+	 */
+	public static function diagnostic(): array {
+		$basename = self::basename();
+
+		$out = [
+			'plugin_basename'  => $basename,
+			'transient_entry'  => false,
+			'transient_key'    => '',
+			'new_version'      => '',
+			'package'          => '',
+			'last_error'       => self::saved_error(),
+			'next_retry_in'    => self::retry_in(),
+			'token_configured' => '' !== self::token(),
+		];
+
+		$transient = get_site_transient( 'update_plugins' );
+		if ( ! is_object( $transient ) || ! isset( $transient->response ) || ! is_array( $transient->response ) ) {
+			return $out;
+		}
+
+		$entry = null;
+		$key   = '';
+
+		if ( isset( $transient->response[ $basename ] ) && is_object( $transient->response[ $basename ] ) ) {
+			$entry = $transient->response[ $basename ];
+			$key   = $basename;
+		} else {
+			// No entry under our key: report a dangling one, if any, so the
+			// badge/list mismatch is visible directly.
+			$main = wp_basename( LPT_PLUGIN_FILE );
+			foreach ( $transient->response as $candidate_key => $candidate ) {
+				if ( ! is_object( $candidate ) || empty( $candidate->plugin ) ) {
+					continue;
+				}
+				if ( wp_basename( (string) $candidate->plugin ) !== $main ) {
+					continue;
+				}
+				$entry = $candidate;
+				$key   = (string) $candidate_key;
+				break;
 			}
 		}
 
-		if ( ! $ours ) {
-			return;
+		if ( ! is_object( $entry ) ) {
+			return $out;
 		}
 
-		// The cached release still describes the version that was just
-		// installed; dropping it makes the next check read GitHub again instead
-		// of serving the stale new_version/tested pair.
-		$this->flush();
+		$out['transient_entry'] = true;
+		$out['transient_key']   = $key;
+		$out['new_version']     = isset( $entry->new_version ) ? (string) $entry->new_version : '';
+		$out['package']         = isset( $entry->package ) ? (string) $entry->package : '';
+
+		return $out;
 	}
 
 	/**
@@ -357,10 +424,49 @@ final class LPT_GitHub_Updater {
 			'lpt_force_check'
 		);
 
-		$links              = (array) $links;
+		$links = (array) $links;
+
+		// The last check failed: say so, otherwise "no update" and "the check
+		// crashed" look exactly the same in the plugin row.
+		$error = self::saved_error();
+		if ( null !== $error ) {
+			$links['lpt_state'] = '<span class="lpt-check-failed" style="color:#b32d2e">'
+				. esc_html( self::error_label( $error ) )
+				. '</span>';
+		}
+
 		$links['lpt_check'] = '<a href="' . esc_url( $url ) . '">' . esc_html__( 'Проверить обновления', 'limit-post-tags' ) . '</a>';
 
 		return $links;
+	}
+
+	/**
+	 * Explains a failed check on the Plugins screen.
+	 *
+	 * Without it the failure is invisible: WordPress only shows "no updates",
+	 * and an exhausted GitHub quota looks like a plugin without releases.
+	 */
+	public function admin_notices(): void {
+		if ( ! current_user_can( 'update_plugins' ) ) {
+			return;
+		}
+
+		$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+		if ( ! $screen || 'plugins' !== $screen->id ) {
+			return;
+		}
+
+		$error = self::saved_error();
+		if ( null === $error ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-warning"><p><strong>%s</strong> %s %s</p></div>',
+			esc_html__( 'Limit Post Tags: проверка обновлений не удалась.', 'limit-post-tags' ),
+			esc_html( self::error_label( $error ) . '.' ),
+			esc_html( self::error_hint( $error ) )
+		);
 	}
 
 	/**
@@ -375,6 +481,10 @@ final class LPT_GitHub_Updater {
 		}
 		check_admin_referer( 'lpt_force_check' );
 
+		// The click is an explicit request for a fresh check: ignore and drop
+		// the error backoff, then flush the caches and ask GitHub again.
+		self::$force = true;
+
 		$this->flush();
 
 		require_once ABSPATH . 'wp-admin/includes/update.php';
@@ -387,12 +497,17 @@ final class LPT_GitHub_Updater {
 	}
 
 	/**
-	 * Drops the cached release and the core update transient.
+	 * Drops every cached value of this class.
+	 *
+	 * Called after an upgrade, so the next run does not reuse the release
+	 * data (and the header values) read before the files were replaced.
 	 */
 	private function flush(): void {
-		delete_transient( LPT_Config::UPDATE_TRANSIENT );
-		delete_transient( LPT_Config::UPDATE_ERROR_TRANSIENT );
+		delete_transient( self::TRANSIENT );
+		delete_transient( self::ERROR_TRANSIENT );
 		delete_site_transient( 'update_plugins' );
+
+		self::$header = null;
 	}
 
 	/* ============================================================
@@ -400,45 +515,52 @@ final class LPT_GitHub_Updater {
 	 * ============================================================ */
 
 	/**
-	 * Latest version data: the highest version the two GitHub sources report.
-	 * The result is cached for six hours; a check where both sources failed is
-	 * remembered for fifteen minutes (backoff).
-	 *
-	 * @return array<string,mixed>|null
+	 * Latest version data (6 hour cache, 15 minute error cache).
 	 */
 	private function get_release(): ?array {
-		$cached = get_transient( LPT_Config::UPDATE_TRANSIENT );
+		$cached = get_transient( self::TRANSIENT );
 		if ( is_array( $cached ) && isset( $cached['version'], $cached['package'] ) ) {
 			return $cached;
 		}
 
-		if ( get_transient( LPT_Config::UPDATE_ERROR_TRANSIENT ) ) {
+		// An explicit force-check is not answered from the backoff: the user
+		// asked for a request, and a cached failure must not fake an answer.
+		if ( ! self::$force && null !== self::saved_error() ) {
 			return null;
 		}
 
-		$release = $this->fetch_release();
+		$this->last_error = null;
+		$release          = $this->fetch_release();
 
 		if ( $release === null ) {
-			set_transient( LPT_Config::UPDATE_ERROR_TRANSIENT, 1, LPT_Config::UPDATE_ERROR_TTL );
+			$error = $this->last_error ?? [
+				'code'   => 404,
+				'reason' => 'not_found',
+				'at'     => time(),
+			];
+
+			set_transient( self::ERROR_TRANSIENT, $error, 900 );
+
 			return null;
 		}
 
-		set_transient( LPT_Config::UPDATE_TRANSIENT, $release, LPT_Config::UPDATE_CACHE_TTL );
+		// A success clears the backoff: the next scheduled check may run again.
+		delete_transient( self::ERROR_TRANSIENT );
+		set_transient( self::TRANSIENT, $release, 21600 );
 
 		return $release;
 	}
 
 	/**
-	 * Picks the higher of the latest release and the highest tag.
+	 * Latest version data: the highest version of both sources.
 	 *
-	 * Both sources are queried in the same check, sequentially and with the
-	 * same timeout, and the cache stores the winner. A partial answer is used
-	 * as is; null is returned only when both requests failed, which is what
-	 * arms the error backoff.
+	 * Both sources are always queried (the winner is cached as a whole).
+	 * Taking the release and using the tag only when there is no release
+	 * hides a fresh tag behind an older GitHub Release: the repository
+	 * keeps release 1.6.3, the owner pushes tag 1.7.0, and the update is
+	 * never offered until a release is created by hand.
 	 *
-	 * On equal versions the release wins: it carries the changelog text.
-	 *
-	 * @return array<string,mixed>|null
+	 * Equal versions: the release wins, it carries the changelog.
 	 */
 	private function fetch_release(): ?array {
 		$release = $this->fetch_latest_release();
@@ -457,11 +579,8 @@ final class LPT_GitHub_Updater {
 		return version_compare( $tag['version'], $release['version'], '>' ) ? $tag : $release;
 	}
 
-	/**
-	 * @return array<string,mixed>|null
-	 */
 	private function fetch_latest_release(): ?array {
-		$body = $this->api_get( sprintf( 'https://api.github.com/repos/%s/releases/latest', LPT_Config::REPO ) );
+		$body = $this->api_get( sprintf( 'https://api.github.com/repos/%s/releases/latest', 'Gnoztis/limit-post-tags' ) );
 		if ( $body === null ) {
 			return null;
 		}
@@ -485,14 +604,14 @@ final class LPT_GitHub_Updater {
 	}
 
 	/**
-	 * Highest semver tag from the tag list. The package is the GitHub zipball
-	 * of that tag; its URL goes through the same host allowlist as a release
-	 * asset.
-	 *
-	 * @return array<string,mixed>|null
+	 * Highest semver tag of the repository. Competes with the release in
+	 * fetch_release(); a tag without a GitHub Release is a normal case.
 	 */
 	private function fetch_latest_tag(): ?array {
-		$tags = $this->api_get( sprintf( 'https://api.github.com/repos/%s/tags?per_page=30', LPT_Config::REPO ) );
+		$tags = $this->api_get(
+			sprintf( 'https://api.github.com/repos/%s/tags?per_page=30', 'Gnoztis/limit-post-tags' )
+		);
+
 		if ( ! is_array( $tags ) ) {
 			return null;
 		}
@@ -519,7 +638,11 @@ final class LPT_GitHub_Updater {
 		}
 
 		$package = $this->safe_package_url(
-			sprintf( 'https://api.github.com/repos/%s/zipball/%s', LPT_Config::REPO, rawurlencode( $best_tag ) )
+			sprintf(
+				'https://api.github.com/repos/%s/zipball/%s',
+				'Gnoztis/limit-post-tags',
+				rawurlencode( $best_tag )
+			)
 		);
 
 		if ( $package === '' ) {
@@ -534,12 +657,11 @@ final class LPT_GitHub_Updater {
 	 * @param string $package
 	 * @param string $body
 	 * @param string $published_at
-	 * @return array<string,mixed>
 	 */
 	private function build_release( string $version, string $package, string $body, string $published_at ): array {
 		$header = $this->header_data();
 
-		return array(
+		return [
 			'version'      => $version,
 			'package'      => $package,
 			'body'         => $body,
@@ -547,22 +669,22 @@ final class LPT_GitHub_Updater {
 			'tested'       => $this->tested_version( $header['tested'] ),
 			'requires'     => $header['requires'],
 			'requires_php' => $header['requires_php'],
-		);
+		];
 	}
 
 	/**
 	 * "Tested up to" turned into the value WordPress compares with.
 	 *
-	 * The header holds a branch claim ("7.1"), while the update screen compares
-	 * the stored value with the full running version ("7.1.5"):
-	 * `version_compare( $update->tested, $cur_wp_version, '>=' )`. A branch
-	 * claim is always lower than a patch release, which is why a bare "7.1"
-	 * still renders "Compatibility with WordPress 7.1.5: Not tested".
+	 * The header holds a branch claim ("7.1"), while the update screen
+	 * compares the stored value with the full running version ("7.1.5"):
+	 * version_compare( $update->tested, $cur_wp_version, '>=' ). A branch
+	 * claim is always lower than a patch release, so a bare "7.1" still
+	 * renders "Compatibility with WordPress 7.1.5: Not tested".
 	 *
 	 * api.wordpress.org resolves this by serving the patch release of the
 	 * declared branch: readmes say "Tested up to: 7.1" and the API answers
-	 * "7.1.5". The same expansion is done here, so the claim covers the running
-	 * patch release of the branch the author declared.
+	 * "7.1.5". The same expansion is done here, so the claim covers the
+	 * running patch release of the branch the author declared.
 	 *
 	 * @param string $tested Header value, e.g. "7.1"; empty when absent.
 	 * @return string Empty when the header is absent, otherwise a version.
@@ -601,37 +723,195 @@ final class LPT_GitHub_Updater {
 	/**
 	 * GET to the GitHub API with our User-Agent and an optional token.
 	 *
+	 * Failures are recorded in $last_error instead of being flattened to null:
+	 * a 403 rate limit, a 404 tag and a dead network need different advice.
+	 * A 404 is deliberately not recorded — for releases/latest "no release"
+	 * is a normal answer and the tag list may still provide the update.
+	 *
 	 * @return array<string,mixed>|null
 	 */
 	private function api_get( string $url ): ?array {
-		$args = array(
+		// The token is attached only to GitHub hosts: the URL comes from the
+		// repository constant, never from user input.
+		$host  = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+		$args  = [
 			'timeout'     => 5,
 			'redirection' => 2,
-			'headers'     => array(
+			'headers'     => [
 				'Accept'       => 'application/vnd.github+json',
 				'User-Agent'   => 'Limit-Post-Tags/' . LPT_VERSION,
 				'Content-Type' => 'application/json',
-			),
-		);
+			],
+		];
 
-		$token = $this->token();
-		if ( $token !== '' ) {
+		$token = self::token();
+		if ( '' !== $token && ( 'api.github.com' === $host || 'github.com' === $host ) ) {
 			$args['headers']['Authorization'] = 'Bearer ' . $token;
 		}
 
-		// The URL is built from the repository constant, not from user input;
-		// scheme and host of the answer are validated separately.
-		$response = wp_remote_get( $url, $args ); // phpcs:ignore -- URL built from a constant.
+		// The URL is built from the repository constant, not from user
+		// input; scheme and host of the answer are validated separately.
+		$response = wp_remote_get( $url, $args ); // phpcs:ignore -- URL built from the repository constant; scheme and host are validated below.
+
 		if ( is_wp_error( $response ) ) {
+			$this->last_error = [
+				'code'   => 0,
+				'reason' => 'network',
+				'at'     => time(),
+			];
 			return null;
 		}
-		if ( 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+
+		$code = (int) wp_remote_retrieve_response_code( $response );
+
+		if ( 200 !== $code ) {
+			if ( 404 !== $code ) {
+				$this->last_error = [
+					'code'   => $code,
+					'reason' => self::error_reason( $code, $response ),
+					'at'     => time(),
+				];
+			}
 			return null;
 		}
 
 		$body = json_decode( (string) wp_remote_retrieve_body( $response ), true );
 
-		return is_array( $body ) ? $body : null;
+		if ( ! is_array( $body ) ) {
+			$this->last_error = [
+				'code'   => $code,
+				'reason' => 'invalid',
+				'at'     => time(),
+			];
+			return null;
+		}
+
+		return $body;
+	}
+
+	/**
+	 * Why the request failed, in the vocabulary used by the admin notice.
+	 *
+	 * @param int              $code     HTTP status.
+	 * @param array<string,mixed>|WP_Error $response Raw response.
+	 */
+	private static function error_reason( int $code, $response ): string {
+		if ( 429 === $code ) {
+			return 'rate_limit';
+		}
+
+		if ( 403 === $code ) {
+			// GitHub reports an exhausted quota as a 403 with a zero
+			// remaining counter; a plain 403 means the token lacks access.
+			$remaining = '';
+			if ( ! is_wp_error( $response ) ) {
+				$remaining = (string) wp_remote_retrieve_header( $response, 'x-ratelimit-remaining' );
+			}
+
+			return '' === trim( $remaining ) || '0' === trim( $remaining ) ? 'rate_limit' : 'unauthorized';
+		}
+
+		if ( 404 === $code ) {
+			return 'not_found';
+		}
+
+		if ( 401 === $code ) {
+			return 'unauthorized';
+		}
+
+		return 'invalid';
+	}
+
+	/**
+	 * Saved failure of the last check, or null when the last check succeeded.
+	 *
+	 * Before 2.6.2 this transient held a bare `1`, so a rate limit, a missing
+	 * tag and a dead network were indistinguishable. An old-style value may
+	 * still be in the cache right after the upgrade; it is reported as
+	 * "unknown" rather than ignored.
+	 *
+	 * @return array{code:int,reason:string,at:int}|null
+	 */
+	private static function saved_error(): ?array {
+		$error = get_transient( self::ERROR_TRANSIENT );
+
+		if ( is_array( $error ) && isset( $error['reason'] ) ) {
+			return [
+				'code'   => (int) ( $error['code'] ?? 0 ),
+				'reason' => (string) $error['reason'],
+				'at'     => (int) ( $error['at'] ?? 0 ),
+			];
+		}
+
+		if ( $error ) {
+			return [
+				'code'   => 0,
+				'reason' => 'unknown',
+				'at'     => 0,
+			];
+		}
+
+		return null;
+	}
+
+	/**
+	 * Seconds until the failed check may be retried; 0 when there is none.
+	 */
+	private static function retry_in(): int {
+		$error = self::saved_error();
+
+		if ( null === $error || $error['at'] <= 0 ) {
+			return 0;
+		}
+
+		return max( 0, $error['at'] + (int) 900 - time() );
+	}
+
+	/**
+	 * Human readable form of a failure, e.g. "проверка не удалась: 403
+	 * (лимит GitHub API)".
+	 *
+	 * @param array{code:int,reason:string,at:int} $error
+	 */
+	private static function error_label( array $error ): string {
+		$reasons = [
+			'rate_limit'   => __( 'лимит GitHub API', 'limit-post-tags' ),
+			'not_found'    => __( 'репозиторий или тег не найдены', 'limit-post-tags' ),
+			'unauthorized' => __( 'токен отклонён', 'limit-post-tags' ),
+			'network'      => __( 'нет связи с GitHub', 'limit-post-tags' ),
+			'invalid'      => __( 'неожиданный ответ GitHub', 'limit-post-tags' ),
+			'unknown'      => __( 'неизвестная ошибка', 'limit-post-tags' ),
+		];
+
+		$reason = $reasons[ $error['reason'] ] ?? $reasons['unknown'];
+		$code   = $error['code'] > 0 ? (string) $error['code'] : '—';
+
+		return sprintf(
+			/* translators: 1: HTTP status or a dash, 2: failure reason */
+			__( 'проверка не удалась: %1$s (%2$s)', 'limit-post-tags' ),
+			$code,
+			$reason
+		);
+	}
+
+	/**
+	 * What to do about a failure.
+	 *
+	 * @param array{code:int,reason:string,at:int} $error
+	 */
+	private static function error_hint( array $error ): string {
+		switch ( $error['reason'] ) {
+			case 'rate_limit':
+				return __( 'Задайте LPT_GITHUB_TOKEN в wp-config.php: без токена GitHub разрешает 60 запросов в час на IP, с токеном — 5000.', 'limit-post-tags' );
+			case 'not_found':
+				return __( 'Проверьте, что тег вида vX.Y.Z существует в репозитории и репозиторий доступен без авторизации.', 'limit-post-tags' );
+			case 'unauthorized':
+				return __( 'Проверьте LPT_GITHUB_TOKEN: токен должен иметь доступ на чтение публичного репозитория.', 'limit-post-tags' );
+			case 'network':
+				return __( 'Хостинг не смог открыть api.github.com: проверьте исходящие запросы и DNS.', 'limit-post-tags' );
+			default:
+				return __( 'Повторите проверку позже; если ошибка повторяется, посмотрите ответ api.github.com.', 'limit-post-tags' );
+		}
 	}
 
 	/**
@@ -664,8 +944,8 @@ final class LPT_GitHub_Updater {
 	}
 
 	/**
-	 * HTTPS only and GitHub hosts only: the package URL must not point at an
-	 * arbitrary host.
+	 * HTTPS only and GitHub hosts only — the package must not come
+	 * from a field a third-party service could tamper with.
 	 */
 	private function safe_package_url( string $url ): string {
 		$url = esc_url_raw( trim( $url ) );
@@ -680,7 +960,7 @@ final class LPT_GitHub_Updater {
 			return '';
 		}
 
-		$allowed = array( 'api.github.com', 'github.com', 'codeload.github.com', 'objects.githubusercontent.com' );
+		$allowed = [ 'api.github.com', 'github.com', 'codeload.github.com', 'objects.githubusercontent.com' ];
 		if ( ! in_array( strtolower( (string) $host ), $allowed, true ) ) {
 			return '';
 		}
@@ -688,9 +968,6 @@ final class LPT_GitHub_Updater {
 		return $url;
 	}
 
-	/**
-	 * Turns a vX.Y.Z (or X.Y.Z) tag into a version, and rejects anything else.
-	 */
 	private function normalize_version( string $tag ): string {
 		$tag = trim( $tag );
 		if ( ! preg_match( '/^v?(\d+\.\d+(?:\.\d+)?)$/', $tag, $m ) ) {
@@ -700,45 +977,49 @@ final class LPT_GitHub_Updater {
 	}
 
 	/**
-	 * Optional read token for the GitHub API; never hard-coded.
+	 * Personal access token for the GitHub API, if the site provides one.
+	 *
+	 * Optional: a public repository needs no token, but the anonymous quota is
+	 * 60 requests per hour per IP, and several plugins behind one hosting IP
+	 * exhaust it. The value is never printed — diagnostic() only reports
+	 * whether it is configured.
 	 */
-	private function token(): string {
+	private static function token(): string {
 		$token = defined( 'LPT_GITHUB_TOKEN' ) ? (string) LPT_GITHUB_TOKEN : '';
 		$token = (string) apply_filters( 'lpt_github_token', $token );
-
 		return trim( $token );
 	}
 
 	/**
-	 * Requires at least / Tested up to / Requires PHP from the plugin header.
+	 * Version headers of the plugin file.
 	 *
-	 * `tested` and `requires` come from different headers on purpose:
-	 * WordPress reads Requires at least for the minimum version, while the
-	 * Plugins screen shows Tested up to in the compatibility column. Filling
-	 * `tested` with the minimum version makes WordPress report the plugin as
-	 * "not tested" with the current release.
+	 * `Tested up to` and `Requires at least` are different things: the
+	 * first is the newest WordPress the plugin was checked against, the
+	 * second is the oldest it runs on. Feeding the minimum into `tested`
+	 * makes the update screen show "compatibility: unknown", so they are
+	 * read separately and `tested` stays empty when the header is absent.
 	 *
-	 * @return array{tested:string,requires:string,requires_php:string}
+	 * @return array{requires:string,requires_php:string,tested:string}
 	 */
 	private function header_data(): array {
 		if ( self::$header === null ) {
 			$data = function_exists( 'get_file_data' )
 				? get_file_data(
 					LPT_PLUGIN_FILE,
-					array(
+					[
 						'Requires at least' => 'Requires at least',
-						'Tested up to'      => 'Tested up to',
 						'Requires PHP'      => 'Requires PHP',
-					),
+						'Tested up to'      => 'Tested up to',
+					],
 					'plugin'
 				)
-				: array();
+				: [];
 
-			self::$header = array(
-				'tested'       => isset( $data['Tested up to'] ) ? (string) $data['Tested up to'] : '',
+			self::$header = [
 				'requires'     => isset( $data['Requires at least'] ) ? (string) $data['Requires at least'] : '',
 				'requires_php' => isset( $data['Requires PHP'] ) ? (string) $data['Requires PHP'] : '',
-			);
+				'tested'       => isset( $data['Tested up to'] ) ? (string) $data['Tested up to'] : '',
+			];
 		}
 
 		return self::$header;

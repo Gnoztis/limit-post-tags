@@ -79,31 +79,4 @@ final class LPT_Config {
 
 		return $selector;
 	}
-
-	/* ============================================================
-	 *  GitHub updates
-	 * ============================================================ */
-
-	/** GitHub repository the updates come from. */
-	public const REPO = 'Gnoztis/limit-post-tags';
-
-	/** Plugin slug — the GitHub repository name and the release asset name. */
-	public const SLUG = 'limit-post-tags';
-
-	// The installed plugin basename is not a constant: the folder on a site may
-	// differ from the repository slug, so the updater derives the update key
-	// and the target directory from plugin_basename( LPT_PLUGIN_FILE ) at
-	// runtime.
-
-	/** Transient holding the result of the last successful update check. */
-	public const UPDATE_TRANSIENT = 'lpt_github_release';
-
-	/** Transient holding the failure marker of the last update check. */
-	public const UPDATE_ERROR_TRANSIENT = 'lpt_github_release_error';
-
-	/** Successful update check is cached for six hours. */
-	public const UPDATE_CACHE_TTL = 21600;
-
-	/** A failed update check is retried after fifteen minutes. */
-	public const UPDATE_ERROR_TTL = 900;
 }
