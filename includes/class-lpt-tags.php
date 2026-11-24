@@ -15,6 +15,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class LPT_Tags {
 
 	/**
+	 * Cached answer for the current request: does the tag block render?
+	 *
+	 * @var bool|null
+	 */
+	private ?bool $has_tag_block = null;
+
+	/**
 	 * Hooks the styles and the footer script.
 	 */
 	public function register_hooks(): void {
@@ -58,6 +65,48 @@ final class LPT_Tags {
 	}
 
 	/**
+	 * Whether the current page actually renders the tag block.
+	 *
+	 * The assets are useless without the `.post-meta__tags` markup: the owner
+	 * rule keeps them off every other page. The theme prints that block in a
+	 * singular post that has tags and on tag archives (checked against the
+	 * live theme markup); the front page and category archives also list
+	 * posts, but they stay without the plugin assets on purpose.
+	 *
+	 * @return bool
+	 */
+	private function should_output(): bool {
+		if ( ! $this->should_limit() ) {
+			return false;
+		}
+
+		if ( null === $this->has_tag_block ) {
+			$this->has_tag_block = $this->detect_tag_block();
+		}
+
+		return $this->has_tag_block;
+	}
+
+	/**
+	 * Detects the tag block for the current request.
+	 *
+	 * @return bool
+	 */
+	private function detect_tag_block(): bool {
+		if ( is_singular() ) {
+			$post_id = (int) get_queried_object_id();
+			if ( $post_id <= 0 ) {
+				return false;
+			}
+
+			return (bool) get_the_tags( $post_id );
+		}
+
+		// Tag archives render the same footer block for their tag.
+		return is_tag();
+	}
+
+	/**
 	 * Appends a suffix to every part of a comma-separated selector.
 	 *
 	 * A container selector may be a list (".a, .b"); plain concatenation
@@ -90,7 +139,7 @@ final class LPT_Tags {
 	 * them, so the rules do not depend on how the theme nests the tag links.
 	 */
 	public function enqueue_styles(): void {
-		if ( ! $this->should_limit() ) {
+		if ( ! $this->should_output() ) {
 			return;
 		}
 
@@ -175,7 +224,7 @@ final class LPT_Tags {
 	 * the filters return one.
 	 */
 	public function print_js(): void {
-		if ( ! $this->should_limit() ) {
+		if ( ! $this->should_output() ) {
 			return;
 		}
 
