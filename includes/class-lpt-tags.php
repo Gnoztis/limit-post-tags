@@ -103,7 +103,24 @@ final class LPT_Tags {
 		}
 
 		// Tag archives render the same footer block for their tag.
-		return is_tag();
+		if ( is_tag() ) {
+			return true;
+		}
+
+		// A list of posts — the blog page, an archive, a search — carries the same
+		// cards with the same tag block, so it needs the styles and the toggle
+		// too. The loop decides: a page whose posts have no tags gets nothing.
+		if ( is_home() || is_archive() || is_search() || is_front_page() ) {
+			global $wp_query;
+
+			foreach ( (array) ( $wp_query->posts ?? array() ) as $post ) {
+				if ( isset( $post->ID ) && get_the_tags( (int) $post->ID ) ) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -158,18 +175,17 @@ final class LPT_Tags {
 			/* Reset theme clamps and restore the normal text flow. */
 			' . $selector . ',
 			' . $images . ' {
-				display: block !important;
 				-webkit-line-clamp: unset !important;
 				-webkit-box-orient: unset !important;
 				overflow: visible !important;
 				max-height: none !important;
 				text-overflow: clip !important;
-				line-height: 1.6;
+				line-height: inherit;
 			}
 
 			' . $links . ' {
 				display: inline-block;
-				margin: 0 6px 4px 0;
+				margin: 0 8px 0 0;
 				color: inherit;
 				vertical-align: baseline;
 			}
